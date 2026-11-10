@@ -1,0 +1,229 @@
+name: release
+
+# 打 tag（v*）即发布**全平台**插件包，并把「契约符合性 + 能力矩阵」自动提到注册表仓。
+#
+# 流水线（用户 m03392 + m03838 + m03953）：
+#   构建 6 个平台的二进制/插件包 → 发布 release → 下载最新版 conformance 二进制 →
+#   验证契约/能力 → 生成注册表条目（每个平台一条 versions[]）→ 提 PR 到注册表仓。
+#
+# 为什么全平台都在 CI 里构建：用户明确不要在本地交叉编译（m03953），
+# 且只有原生可执行文件跑得起来、能自证 manifest 与包内容。
+# 6 个平台全部在 ubuntu-latest 上交叉编译（CGO_ENABLED=0，纯 Go 无依赖）：
+#   * manifest 由 build.sh 用本机 helper 生成（.mf-helper），内容与平台无关；
+#   * 契约符合性只需验一个平台（同一份代码），故在 publish job 里用本机 linux/amd64 跑。
+#
+# 需要 secret（缺省时该步只打 notice 跳过，不阻断发布——准入摘要属可选信息）：
+#   REGISTRY_TOKEN  wild-work3 组织内有 repo 权限的 PAT（用于向 ww3-ext-registry 提 PR）
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布/补传的 tag（缺省用当前 ref 的 tag）'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_REPO: https://github.com/wild-work3/ww3-cline-ext
+  REGISTRY_REPO: wild-work3/ww3-ext-registry
+  CONFORMANCE_URL: https://github.com/wild-work3/ww3-conformance/releases/latest/download/ww3-conformance-linux-amd64
+
+jobs:
+  # ---- 1. 六平台构建（每个平台一个 job，产物各自上传）----
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - windows/amd64
+          - windows/arm64
+          - linux/amd64
+          - linux/arm64
+          - darwin/amd64
+          - darwin/arm64
+    steps:
+      # 装依赖必须在 checkout 之前？不必——但 setup-go 需要 go.mod 在，故 checkout 在前
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建插件包（${{ matrix.target }}）
+        shell: bash
+        run: bash build.sh --zip --target "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ strategy.job-index }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            dist/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---- 2. 汇总发布 + 契约校验 + 注册表 PR ----
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      # secrets 不能直接写在 step 的 if 里（if 不支持 secrets 上下文），先落到 env 再判空
+      REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # make_registry_entry.py 只用标准库，但别赌 runner 默认版本
+
+      # 6 个平台的 dist/ 合并到一处：只取包（裸二进制的文件名在 linux/darwin 上会互相覆盖）
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: 校验产物齐备
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tmp-mf
+          ls -l dist
+          id=$(sed -n 's/.*"id":[[:space:]]*"\([^"]*\)".*/\1/p' dist/manifest.json | head -1)
+          ver=$(sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p' dist/manifest.json | head -1)
+          [ -n "$id" ] && [ -n "$ver" ] || { echo "manifest 缺 id/version"; exit 1; }
+          n=$(ls dist/"$id-$ver"-*.zip 2>/dev/null | wc -l)
+          [ "$n" -eq 6 ] || { echo "期望 6 个平台包，实际 $n 个"; exit 1; }
+          echo "PLUGIN_ID=$id"   >> "$GITHUB_ENV"
+          echo "PLUGIN_VER=$ver" >> "$GITHUB_ENV"
+
+      # 契约符合性只需一个平台（同一份代码）。这里用本机 linux/amd64 现编一个来跑。
+      - name: 本机编译用于契约校验
+        shell: bash
+        run: bash build.sh          # 不带 --zip，避免覆盖上面收齐的包
+
+      - name: 发布 release（单 job 创建，天然无并发 422）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          [ -n "$tag" ] || tag="${GITHUB_REF_NAME}"
+          case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$tag" --notes "${PLUGIN_ID} ${PLUGIN_VER}"
+          gh release upload "$tag" dist/*.zip dist/*.sha256 --clobber
+
+      # 以下三步都允许失败：注册表只强制 repo/version/file/sha256，
+      # 准入摘要是「锦上添花」，跑不通不该挡住已经发布的二进制。
+      - name: 下载 conformance 二进制
+        id: confdl
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 -o ww3-conformance "$CONFORMANCE_URL"
+          chmod +x ww3-conformance
+          ./ww3-conformance --help >/dev/null
+          echo "ok=1" >> "$GITHUB_OUTPUT"
+
+      - name: 验证契约与能力（B 层，全打本地 mock，零真实上游）
+        id: confrun
+        if: steps.confdl.outputs.ok == '1'
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ./ww3-conformance --exe dist/cline-ext --descriptor conformance.json \
+            --id "$PLUGIN_ID" --out conformance-report \
+            --json-summary conformance-summary.json --print-snippet
+          # 退出码 0=PASS/WARN，1=有 FAIL。FAIL 时不让它静默通过，但也只降级为告警：
+          # 判定与阻断交给插件作者（用户 m02729：本工具不是门禁）。
+          echo "=== 摘要 ==="
+          cat conformance-summary.json
+
+      # 从包名反推平台：<id>-<ver>-<os>-<arch>.zip，倒数两段即 os/arch
+      - name: 生成注册表条目
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          for z in dist/"$PLUGIN_ID-$PLUGIN_VER"-*.zip; do
+            b=$(basename "$z" .zip)
+            arch="${b##*-}"; rest="${b%-*}"; os="${rest##*-}"
+            args+=(--artifact "$os/$arch=$z")
+          done
+          printf '平台条目：%s\n' "${args[*]}"
+          sum=()
+          [ -f conformance-summary.json ] && sum=(--summary conformance-summary.json)
+          python scripts/make_registry_entry.py \
+            --manifest dist/manifest.json \
+            "${args[@]}" "${sum[@]}" \
+            --repo "$PLUGIN_REPO" \
+            --out .registry/"$PLUGIN_ID".json
+          cat .registry/"$PLUGIN_ID".json
+
+      - name: 提 PR 到注册表仓
+        if: env.REGISTRY_TOKEN != ''
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          [ -n "$tag" ] || tag="${GITHUB_REF_NAME}"
+          branch="plugin/${PLUGIN_ID}-${PLUGIN_VER}"
+
+          args=()
+          for z in dist/"$PLUGIN_ID-$PLUGIN_VER"-*.zip; do
+            b=$(basename "$z" .zip)
+            arch="${b##*-}"; rest="${b%-*}"; os="${rest##*-}"
+            args+=(--artifact "$os/$arch=$z")
+          done
+          sum=()
+          [ -f conformance-summary.json ] && sum=(--summary conformance-summary.json)
+
+          # 注册表是平铺文件仓：一个插件一个文件，PR 互不相干（W3-48）
+          rm -rf registry && git clone --depth 1 "https://x-access-token:${REGISTRY_TOKEN}@github.com/${REGISTRY_REPO}.git" registry
+          # 以仓里现有条目为基底做 upsert，保住人工维护的 gateway 门与历史 versions
+          base=registry/"$PLUGIN_ID".json
+
+          python scripts/make_registry_entry.py \
+            --manifest dist/manifest.json \
+            "${args[@]}" "${sum[@]}" \
+            --repo "$PLUGIN_REPO" --base "$base" --out "$base"
+
+          cd registry
+          if git diff --quiet -- "$PLUGIN_ID".json; then
+            echo "注册表条目无变化，跳过 PR"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add "$PLUGIN_ID".json
+          git commit -m "update: ${PLUGIN_ID} ${PLUGIN_VER}（6 平台）"
+          git push -f origin "$branch"
+          summary_state="未附（未跑成功，不影响安装）"
+          [ -f ../conformance-summary.json ] && summary_state="已附"
+          {
+            echo "由 ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} 自动生成。"
+            echo
+            echo "- plugin: \`${PLUGIN_ID}\`"
+            echo "- version: \`${PLUGIN_VER}\`"
+            echo "- 平台: windows/linux/darwin × amd64/arm64（6 条 versions[]，各自独立 sha256）"
+            echo "- 准入摘要: ${summary_state}（注册表该字段可选，不影响安装）"
+          } > ../pr-body.md
+          gh pr create --repo "$REGISTRY_REPO" --base main --head "$branch" \
+            --title "update: ${PLUGIN_ID} ${PLUGIN_VER}（6 平台）" \
+            --body-file ../pr-body.md \
+            || echo "PR 已存在或创建失败，分支 $branch 已更新"
